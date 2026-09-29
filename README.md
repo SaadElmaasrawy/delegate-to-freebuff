@@ -44,7 +44,7 @@ The only human step left is the normal plan approval inside Claude Code.
 ## Install
 
 ```bash
-git clone https://github.com/<your-username>/delegate-to-freebuff.git
+git clone https://github.com/SaadElmaasrawy/delegate-to-freebuff.git
 cd delegate-to-freebuff
 node scripts/install.mjs
 ```

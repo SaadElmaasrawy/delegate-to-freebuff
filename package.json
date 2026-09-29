@@ -5,6 +5,14 @@
   "type": "module",
   "private": true,
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/SaadElmaasrawy/delegate-to-freebuff.git"
+  },
+  "homepage": "https://github.com/SaadElmaasrawy/delegate-to-freebuff#readme",
+  "bugs": {
+    "url": "https://github.com/SaadElmaasrawy/delegate-to-freebuff/issues"
+  },
   "engines": {
     "node": ">=20.11"
   },
