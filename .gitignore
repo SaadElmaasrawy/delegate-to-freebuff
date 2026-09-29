@@ -1,0 +1,8 @@
+node_modules/
+# per-repo queue state written by the dispatcher (only appears if you run the tools inside this repo)
+.briefs/
+# working notes, not part of the project
+TODO.md
+*.log
+.DS_Store
+Thumbs.db

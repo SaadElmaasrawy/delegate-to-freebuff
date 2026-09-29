@@ -1,0 +1,17 @@
+{
+  "name": "delegate-to-freebuff",
+  "version": "0.1.0",
+  "description": "Claude Code skill + hook: hand an approved plan to freebuff automatically, no human typing.",
+  "type": "module",
+  "private": true,
+  "license": "MIT",
+  "engines": {
+    "node": ">=20.11"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@lydell/node-pty": "^1.2.0-beta.15"
+  }
+}
