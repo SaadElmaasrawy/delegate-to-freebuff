@@ -16,8 +16,12 @@ between them.
 
 ```
 plan mode --you approve--> ExitPlanMode PostToolUse hook
-                             |  saves the plan as .briefs/NN-slug.md in your repo
-                             |  starts a detached dispatcher (one per repo, tasks run one at a time)
+                             |  saves the plan as .briefs/NN-slug.md in your repo, ON HOLD
+                             v
+                      Claude asks: "Have you finished all your own edits?"
+                        No  -> stays on hold; tell Claude when you're done (nothing runs meanwhile)
+                        Yes -> `fbq release NN` starts a detached dispatcher
+                               (one per repo, tasks run one at a time)
                              v
                       dispatcher
                         spawns `freebuff --cwd <repo>` in a hidden PTY   (fresh session per task)
@@ -33,7 +37,9 @@ If freebuff crashes, stalls or times out, the dispatcher writes a `status: block
 never waits forever. The plan is wrapped with rules: never `git commit`/`push`/`stash` (you or Claude commit
 after review), run the verify steps, report honestly.
 
-The only human step left is the normal plan approval inside Claude Code.
+You never type into freebuff. Your part is the normal plan approval plus one yes/no question, asked so freebuff
+doesn't start editing files while you're still editing them (its changes would collide with yours and blur
+the review diff). Turn the question off with `fbq confirm off` for a fully hands-off flow.
 
 ## Requirements
 
@@ -63,15 +69,19 @@ node scripts/install.mjs --uninstall --purge    # also delete the installed skil
 
 ## Use
 
-- **Automatic:** enter plan mode, approve the plan. Claude waits on freebuff and reviews.
-- **Manual:** run `/delegate-to-freebuff`, or ask Claude to hand a task to freebuff.
+- **Automatic:** enter plan mode, approve the plan. Claude asks whether you've finished your edits. Answer
+  **yes** and freebuff starts; Claude waits on it and reviews. Answer **no** and the plan stays on hold; later
+  tell Claude you're done (e.g. "go") and it starts freebuff then.
+- **Manual:** run `/delegate-to-freebuff`, or ask Claude to hand a task to freebuff (it asks the same question first).
 - **Watch live (optional):** `node ~/.claude/skills/delegate-to-freebuff/scripts/fbq.mjs watch` in a terminal.
+- **Skip the question:** `node ~/.claude/skills/delegate-to-freebuff/scripts/fbq.mjs confirm off`
+  (or set `FREEBUFF_CONFIRM=0`); freebuff then starts the moment a plan is approved. `confirm on` restores it.
 - **Off switch:** `node ~/.claude/skills/delegate-to-freebuff/scripts/fbq.mjs auto off` (or set `FREEBUFF_AUTO=0`).
   The hook is global, so it fires for every approved plan in every project, including plans that aren't code.
 
-`fbq.mjs` commands: `status`, `handoff`, `add`, `wait`, `reviewed`, `tail`, `watch`, `dispatcher start|stop|status`,
-`auto on|off`. See [SKILL.md](SKILL.md) for the review loop and troubleshooting. Every hook call is logged to
-`~/.claude/delegate-to-freebuff.log`.
+`fbq.mjs` commands: `status`, `handoff [--hold]`, `add`, `release`, `wait`, `reviewed`, `tail`, `watch`,
+`dispatcher start|stop|status`, `auto on|off`, `confirm on|off`. See [SKILL.md](SKILL.md) for the review loop and
+troubleshooting. Every hook call is logged to `~/.claude/delegate-to-freebuff.log`.
 
 ## Configuration
 
@@ -86,14 +96,18 @@ Environment variables, read by the dispatcher:
 | `FB_READY_MAX_S` | `25` | max wait for the freebuff TUI to settle before typing |
 | `FB_TRUST_AGENTS` | unset | `1` passes `--trust-agents` to freebuff (see security) |
 | `FREEBUFF_AUTO` | unset | `0` disables the hook, same as `fbq auto off` |
+| `FREEBUFF_CONFIRM` | unset | `0` skips the "finished your edits?" question, same as `fbq confirm off` |
+
+The `auto` and `confirm` switches are also stored in `~/.claude/delegate-to-freebuff.json`.
 
 ## Security and privacy
 
 Read this before installing. The hook turns "approve a plan" into "an AI agent with shell and file access
 runs on your machine".
 
-- **Approving a plan is authorizing freebuff to carry it out**, unattended, in your repo. Read plans before
-  approving them. Use `auto off` or uninstall if that isn't what you want.
+- **Approving a plan and answering "yes, I'm done editing" is authorizing freebuff to carry it out**,
+  unattended, in your repo. Read plans before approving them. Use `auto off` or uninstall if that isn't what
+  you want. With `confirm off`, approving the plan alone starts freebuff.
 - **Data leaves your machine through freebuff, not through this project.** The plan text, and whatever
   freebuff reads while working, are sent to freebuff's service under its own terms. Apart from the
   `npm install` the installer runs, the scripts here make no network calls of their own.
@@ -108,7 +122,7 @@ runs on your machine".
 
 ## Status and platform support
 
-- **Tested on:** Windows 11, Node 24, freebuff 0.1.6, Claude Code 2.1.128. The 19 automated tests
+- **Tested on:** Windows 11, Node 24, freebuff 0.1.6, Claude Code 2.1.128. The 22 automated tests
   (`npm test`) cover the queue, the installer and the hook and dispatcher end to end against a fake freebuff.
   They also cover the crash and stall paths and a repo path containing a space.
 - **Run against real freebuff:** a real plan went through the hook to a real freebuff session, which

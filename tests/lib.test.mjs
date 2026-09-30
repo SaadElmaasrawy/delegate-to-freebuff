@@ -4,7 +4,8 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { rm, tmp } from "./helpers.mjs";
 import {
-  addBrief, briefsDir, claimNext, dur, ensureBriefs, planTitle, planToBrief, queueOrder, slugify, stripAnsi, tasks, writeBlockedReport,
+  addBrief, briefsDir, claimNext, dur, ensureBriefs, planTitle, planToBrief, queueOrder, releaseTask, slugify, stripAnsi, tasks,
+  writeBlockedReport,
 } from "../scripts/lib.mjs";
 
 test("slugify and planTitle", () => {
@@ -51,6 +52,28 @@ test("front briefs jump the queue; claimNext is ordered and atomic", async () =>
     assert.deepEqual(ids, ["01-one", "02-two", "03-fix"], "each task claimed exactly once");
     assert.equal(claims.filter((c) => c === null).length, 1);
     assert.deepEqual(tasks(briefsDir(repo)).map((t) => t.state), ["working", "working", "working"]);
+  } finally { rm(repo); }
+});
+
+test("held tasks are neither queued nor claimable until released", async () => {
+  const repo = tmp();
+  try {
+    const held = await addBrief(repo, { slug: "later", body: "x", hold: true });
+    const dir = briefsDir(repo);
+    assert.equal(held.position, 0);
+    assert.equal(tasks(dir)[0].state, "held");
+    assert.deepEqual(queueOrder(tasks(dir)), []);
+    assert.equal(await claimNext(repo, "t"), null);
+
+    // a normal task queued behind it is still claimable; the held one stays put
+    await addBrief(repo, { slug: "now", body: "y" });
+    assert.equal((await claimNext(repo, "t")).id, "02-now");
+    assert.equal(tasks(dir)[0].state, "held");
+
+    assert.equal(releaseTask(repo, "01").id, "01-later");
+    assert.equal(tasks(dir)[0].state, "queued");
+    assert.throws(() => releaseTask(repo, "01"), /not held/);
+    assert.equal((await claimNext(repo, "t")).id, "01-later");
   } finally { rm(repo); }
 });
 

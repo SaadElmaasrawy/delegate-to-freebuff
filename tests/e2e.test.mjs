@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { join } from "node:path";
-import { SCRIPTS, fakeFreebuffShim, isolatedEnv, rm, run, tmp, until } from "./helpers.mjs";
+import { SCRIPTS, fakeFreebuffShim, isolatedEnv, rm, run, sleep, tmp, until } from "./helpers.mjs";
 
 const HOOK = join(SCRIPTS, "on-plan-approved.mjs");
 const FBQ = join(SCRIPTS, "fbq.mjs");
@@ -72,11 +72,68 @@ test("hook tells Claude, and queues nothing, when freebuff is missing", async ()
   } finally { await s.finish(); }
 });
 
-test("plan approval -> queued -> fake freebuff gets the prompt typed into a hidden PTY -> done -> closed -> dispatcher exits",
+test("by default the plan is held and Claude must ask first; freebuff starts only after release", { timeout: 90_000 }, async () => {
+  const s = sandbox();
+  try {
+    const r = await run(HOOK, [], { env: s.env(), input: payload(s.repo) }); // confirm is on by default
+    assert.equal(r.code, 0, r.stderr);
+    const ctx = JSON.parse(r.stdout).hookSpecificOutput.additionalContext;
+    assert.match(ctx, /ON HOLD/);
+    assert.match(ctx, /AskUserQuestion/);
+    assert.match(ctx, /Have you finished all your own edits\?/);
+    assert.match(ctx, /Yes, start freebuff/);
+    assert.match(ctx, /release 01/);
+    assert.match(ctx, /Do NOT implement the plan yourself/);
+
+    // nothing may have started: give a wrongly spawned dispatcher time to show up
+    await sleep(2500);
+    assert.equal(existsSync(join(s.briefs, ".dispatcher.json")), false);
+    assert.equal(existsSync(join(s.briefs, ".dispatcher.log")), false);
+    assert.equal(existsSync(join(s.briefs, "01-add-greeting.hold")), true);
+
+    const status = await run(FBQ, ["status", "--cd", s.repo], { env: s.env() });
+    assert.match(status.stdout, /01-add-greeting: held/);
+    assert.match(status.stdout, /queue: empty/);
+
+    // `wait` on a held task must not hang and must not start it
+    const w = await run(FBQ, ["wait", "01", "--cd", s.repo, "--timeout-min", "0.5"], { env: s.env() });
+    assert.equal(w.code, 3);
+    assert.match(w.stdout, /^HELD 01-add-greeting/);
+    assert.equal(existsSync(join(s.briefs, ".dispatcher.json")), false, "wait must not start a held task");
+
+    // the user said yes
+    const rel = await run(FBQ, ["release", "01", "--cd", s.repo], { env: s.env() });
+    assert.equal(rel.code, 0, rel.stdout);
+    assert.match(rel.stdout, /released 01-add-greeting/);
+    await until(() => existsSync(s.done("01-add-greeting")) && readFileSync(s.done("01-add-greeting"), "utf8").length > 0,
+      { timeout: 45_000, what: "done report after release" });
+    assert.match(readFileSync(s.done("01-add-greeting"), "utf8"), /fake freebuff saw: Read \.briefs\/01-add-greeting\.md/);
+
+    const again = await run(FBQ, ["release", "01", "--cd", s.repo], { env: s.env() });
+    assert.equal(again.code, 1);
+    assert.match(again.stdout, /not held/);
+  } finally { await s.finish(); }
+});
+
+test("confirm on/off is stored globally and does not disturb the auto switch", async () => {
+  const s = sandbox();
+  try {
+    const fbq = (...a) => run(FBQ, [...a, "--cd", s.repo], { env: s.env() });
+    assert.match((await fbq("confirm")).stdout, /: ON/);
+    assert.match((await fbq("confirm", "off")).stdout, /: OFF/);
+    assert.match((await fbq("auto", "off")).stdout, /plan approval: OFF/);
+    assert.match((await fbq("confirm")).stdout, /: OFF/, "touching auto must not reset confirm");
+    assert.match((await fbq("auto", "on")).stdout, /plan approval: ON/);
+    assert.match((await fbq("confirm", "on")).stdout, /: ON/);
+    assert.deepEqual(JSON.parse(readFileSync(join(s.home, ".claude", "delegate-to-freebuff.json"), "utf8")), { auto: true, confirm: true });
+  } finally { await s.finish(); }
+});
+
+test("with confirm off: plan approval -> queued -> fake freebuff gets the prompt typed into a hidden PTY -> done -> closed -> dispatcher exits",
   { timeout: 90_000 }, async () => {
     const s = sandbox({ repoName: "repo with space" }); // real project paths often contain spaces
     try {
-      const r = await run(HOOK, [], { env: s.env(), input: payload(s.repo) });
+      const r = await run(HOOK, [], { env: s.env({ FREEBUFF_CONFIRM: "0" }), input: payload(s.repo) });
       assert.equal(r.code, 0, r.stderr);
       const out = JSON.parse(r.stdout).hookSpecificOutput;
       assert.equal(out.hookEventName, "PostToolUse");

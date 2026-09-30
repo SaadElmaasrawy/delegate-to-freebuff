@@ -3,16 +3,21 @@
  * fbq — orchestrator CLI for delegate-to-freebuff. State lives in <repo>/.briefs/ (see lib.mjs).
  *
  *   status [--json]                     dispatcher state + every task's state
- *   handoff --file <plan.md> [--slug s] [--front]
- *                                       queue a plan/brief and start the dispatcher if it isn't running
- *   add --slug <s> --file <brief.md> [--front]
+ *   handoff --file <plan.md> [--slug s] [--front] [--hold]
+ *                                       queue a plan/brief and start the dispatcher if it isn't running;
+ *                                       with --hold, queue it but do NOT start anything until `release`
+ *   add --slug <s> --file <brief.md> [--front] [--hold]
  *                                       queue only (the dispatcher picks it up if it is running)
- *   wait <NN> [--timeout-min 60]        block until NN has a done report (restarts a dead dispatcher)
+ *   release <NN>                        lift the hold on NN and start the dispatcher
+ *   wait <NN> [--timeout-min 60]        block until NN has a done report (restarts a dead dispatcher;
+ *                                       a held task returns HELD at once, exit code 3)
  *   reviewed <NN>                       mark NN reviewed
  *   tail [--lines 40]                   last terminal output of the freebuff run (ANSI stripped, best effort)
  *   watch                               live replay of the current freebuff terminal (run in a VS Code terminal)
  *   dispatcher start|stop|status        control the background dispatcher
  *   auto on|off|status                  switch the ExitPlanMode hook's automatic handoff (global)
+ *   confirm on|off|status               on (default): the hook holds the plan and Claude asks "have you finished
+ *                                       your edits?" before freebuff starts; off: start immediately (global)
  *
  * All repo commands take --cd <repo> (default: current directory).
  */
@@ -20,8 +25,8 @@ import { execFileSync } from "node:child_process";
 import { existsSync, openSync, readSync, readdirSync, readFileSync, closeSync, statSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import {
-  FBQ, addBrief, autoEnabled, briefsDir, dispatcherInfo, findTask, freebuffInstalled, now, planTitle, queueOrder,
-  readDispatcher, setAuto, sleep, slugify, startDispatcher, stripAnsi, tasks,
+  FBQ, addBrief, autoEnabled, briefsDir, confirmEnabled, dispatcherInfo, findTask, freebuffInstalled, now, planTitle, queueOrder,
+  readDispatcher, releaseTask, setConfig, sleep, slugify, startDispatcher, stripAnsi, tasks,
 } from "./lib.mjs";
 
 function parse(argv) {
@@ -29,6 +34,7 @@ function parse(argv) {
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--front") out.front = true;
+    else if (a === "--hold") out.hold = true;
     else if (a === "--json") out.json = true;
     else if (a.startsWith("--")) out[a.slice(2)] = argv[++i];
     else out._.push(a);
@@ -76,9 +82,12 @@ async function main() {
       if (args.json) { console.log(JSON.stringify({ repo, dispatcher: d, queue: order, tasks: list }, null, 2)); return; }
       console.log(`dispatcher: ${d.alive ? "RUNNING" : "STOPPED"} (${d.detail})`);
       console.log(`auto handoff on plan approval: ${autoEnabled() ? "ON" : "OFF"}`);
+      console.log(`ask before starting freebuff (confirm): ${confirmEnabled() ? "ON" : "OFF"}`);
       console.log(`queue: ${order.length ? order.join(", ") : "empty"}`);
       for (const t of list.filter((x) => x.state !== "reviewed")) {
-        const extra = t.state === "queued" ? ` (position ${order.indexOf(t.id) + 1})` : t.doneStatus ? ` [${t.doneStatus}] -> needs review` : "";
+        const extra = t.state === "queued" ? ` (position ${order.indexOf(t.id) + 1})`
+          : t.state === "held" ? ` (HELD until the user has finished their edits; then: release ${t.nn})`
+            : t.doneStatus ? ` [${t.doneStatus}] -> needs review` : "";
         console.log(`  ${t.id}: ${t.state}${extra}`);
       }
       return;
@@ -86,15 +95,17 @@ async function main() {
 
     case "handoff":
     case "add": {
-      const file = need(args.file, `${cmd} --file <plan-or-brief.md> [--slug kebab-slug] [--front]${cmd === "add" ? " (--slug required)" : ""}`);
+      const file = need(args.file, `${cmd} --file <plan-or-brief.md> [--slug kebab-slug] [--front] [--hold]${cmd === "add" ? " (--slug required)" : ""}`);
       if (!existsSync(file)) die(`file not found: ${file}`);
       const body = readFileSync(file, "utf8");
       if (!body.trim()) die(`file is empty: ${file}`);
       const slug = args.slug || (cmd === "handoff" ? slugify(planTitle(body)) : need(null, "add --slug <kebab-slug> --file <brief.md>"));
-      const { id, position } = await addBrief(repo, { slug, body, front: !!args.front });
-      console.log(`queued ${id} at position ${position}`);
+      const { id, position } = await addBrief(repo, { slug, body, front: !!args.front, hold: !!args.hold });
+      console.log(args.hold ? `queued ${id} on HOLD (freebuff not started)` : `queued ${id} at position ${position}`);
       console.log(`brief: ${join(dir, id + ".md")}`);
-      if (cmd === "handoff") {
+      if (args.hold) {
+        console.log(`held: nothing runs until: node ${q(FBQ)} release ${id.slice(0, 2)} --cd ${q(repo)}`);
+      } else if (cmd === "handoff") {
         if (!freebuffInstalled()) die("freebuff is not installed or not on PATH (npm i -g freebuff, then `freebuff login`)", 1);
         console.log(`dispatcher: ${startDispatcher(repo) === "started" ? "started (hidden freebuff will receive the task automatically)" : "already running"}`);
         console.log(`next: node ${q(FBQ)} wait ${id.slice(0, 2)} --cd ${q(repo)} --timeout-min 60   (run in background)`);
@@ -116,8 +127,14 @@ async function main() {
           console.log(readFileSync(done, "utf8"));
           return;
         }
-        // Self-heal: a queued task with no dispatcher would wait forever.
         const cur = tasks(dir).find((x) => x.id === t.id);
+        // A held task never starts by itself: waiting would hang. Tell the caller to release it first.
+        if (cur?.state === "held") {
+          console.log(`HELD ${t.id}: freebuff has not been started because the user may still be editing. Nothing to wait for yet.`);
+          console.log(`When the user confirms their edits are finished, run: node ${q(FBQ)} release ${t.nn} --cd ${q(repo)}`);
+          process.exit(3);
+        }
+        // Self-heal: a queued task with no dispatcher would wait forever.
         if (cur?.state === "queued" && !dispatcherInfo(dir).alive) {
           if (!warned) { console.log(`note: dispatcher was not running; restarting it for ${t.id}`); warned = true; }
           startDispatcher(repo);
@@ -129,6 +146,18 @@ async function main() {
       }
       console.log(`TIMEOUT ${t.id}: no done report yet. dispatcher: ${dispatcherInfo(dir).detail}\n${dispatcherLogTail()}`);
       process.exit(1);
+    }
+
+    case "release": {
+      const ref = need(args._[1], "release <NN>");
+      const t = findTask(dir, ref);
+      if (t.state !== "held") die(`${t.id} is not held (state: ${t.state}); nothing to release`, 1);
+      if (!freebuffInstalled()) die("freebuff is not installed or not on PATH (npm i -g freebuff, then `freebuff login`); task left on hold", 1);
+      releaseTask(repo, ref);
+      console.log(`released ${t.id}`);
+      console.log(`dispatcher: ${startDispatcher(repo) === "started" ? "started (hidden freebuff will receive the task automatically)" : "already running"}`);
+      console.log(`next: node ${q(FBQ)} wait ${t.nn} --cd ${q(repo)} --timeout-min 60   (run in background)`);
+      return;
     }
 
     case "reviewed": {
@@ -191,13 +220,20 @@ async function main() {
 
     case "auto": {
       const sub = args._[1];
-      if (sub === "on" || sub === "off") { setAuto(sub === "on"); console.log(`automatic handoff on plan approval: ${sub.toUpperCase()}`); }
-      else console.log(`automatic handoff on plan approval: ${autoEnabled() ? "ON" : "OFF"}`);
+      if (sub === "on" || sub === "off") setConfig({ auto: sub === "on" });
+      console.log(`automatic handoff on plan approval: ${autoEnabled() ? "ON" : "OFF"}`);
+      return;
+    }
+
+    case "confirm": {
+      const sub = args._[1];
+      if (sub === "on" || sub === "off") setConfig({ confirm: sub === "on" });
+      console.log(`ask "finished your edits?" before freebuff starts: ${confirmEnabled() ? "ON" : "OFF"}`);
       return;
     }
 
     default:
-      die("usage: fbq.mjs <status|handoff|add|wait|reviewed|tail|watch|dispatcher|auto> [--cd <repo>] ... (see header)");
+      die("usage: fbq.mjs <status|handoff|add|release|wait|reviewed|tail|watch|dispatcher|auto|confirm> [--cd <repo>] ... (see header)");
   }
 }
 

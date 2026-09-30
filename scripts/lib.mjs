@@ -4,6 +4,7 @@
 // Files in .briefs/:
 //   NN-slug.md           the brief (queued until claimed)
 //   NN-slug.front        marker: jump the queue (fix briefs)
+//   NN-slug.hold         marker: queued but held until `fbq release` (the user is still editing)
 //   NN-slug.working      claimed: {at, by, pid}
 //   NN-slug.done.md      done report (written by freebuff, or by the dispatcher when freebuff fails)
 //   NN-slug.reviewed     reviewed by the orchestrator
@@ -76,7 +77,8 @@ export function tasks(dir) {
       const id = `${m[1]}-${m[2]}`;
       const state = has(`${id}.reviewed`) ? "reviewed"
         : has(`${id}.done.md`) ? "done"
-          : has(`${id}.working`) ? "working" : "queued";
+          : has(`${id}.working`) ? "working"
+            : has(`${id}.hold`) ? "held" : "queued";
       let doneStatus = null;
       if (state === "done" || state === "reviewed") {
         const s = readFileSync(join(dir, `${id}.done.md`), "utf8").match(/status:\s*(\w+)/i);
@@ -111,20 +113,33 @@ export function doneSection(id) {
   ].join("\n");
 }
 
-/** Queue a brief. Returns { id, position }. The done-report instructions are appended here. */
-export async function addBrief(repo, { slug, body, front = false }) {
+/**
+ * Queue a brief. Returns { id, position } (position 0 when held). The done-report instructions are appended here.
+ * A held brief is not run until releaseTask(): the dispatcher only claims tasks in the "queued" state.
+ */
+export async function addBrief(repo, { slug, body, front = false, hold = false }) {
   if (!slug || !/^[a-z0-9][a-z0-9-]*$/.test(slug)) throw new Error("slug must be kebab-case (a-z, 0-9, -)");
   const dir = ensureBriefs(repo);
   const id = await withLock(dir, async () => {
     const max = tasks(dir).reduce((m, t) => Math.max(m, parseInt(t.nn, 10)), 0);
     const id = `${String(max + 1).padStart(2, "0")}-${slug}`;
     if (front) writeFileSync(join(dir, `${id}.front`), "");
+    if (hold) writeFileSync(join(dir, `${id}.hold`), now()); // before the rename, so it is never visible as queued
     // write-then-rename so the dispatcher never claims a half-written brief
     writeFileSync(join(dir, `${id}.md.tmp`), body.replace(/\s+$/, "\n") + doneSection(id));
     renameSync(join(dir, `${id}.md.tmp`), join(dir, `${id}.md`));
     return id;
   });
   return { id, position: queueOrder(tasks(dir)).findIndex((t) => t.id === id) + 1 };
+}
+
+/** Lift the hold on a task so the dispatcher may run it. Throws unless the task is held. */
+export function releaseTask(repo, ref) {
+  const dir = briefsDir(repo);
+  const t = findTask(dir, ref);
+  if (t.state !== "held") throw new Error(`${t.id} is not held (state: ${t.state})`);
+  rmSync(join(dir, `${t.id}.hold`), { force: true });
+  return t;
 }
 
 /** Atomically claim the next queued task, or null. */
@@ -222,14 +237,25 @@ export function planToBrief(plan) {
 
 // ---------- misc ----------
 
-export function autoEnabled() {
-  if (process.env.FREEBUFF_AUTO === "0") return false;
-  try { return JSON.parse(readFileSync(AUTO_FILE, "utf8")).auto !== false; } catch { return true; }
+function readConfig() {
+  try { return JSON.parse(readFileSync(AUTO_FILE, "utf8")); } catch { return {}; }
 }
 
-export function setAuto(on) {
+/** Does plan approval hand the plan to freebuff at all? (default: yes) */
+export function autoEnabled() {
+  if (process.env.FREEBUFF_AUTO === "0") return false;
+  return readConfig().auto !== false;
+}
+
+/** Hold the plan and ask the user "have you finished your edits?" before freebuff starts? (default: yes) */
+export function confirmEnabled() {
+  if (process.env.FREEBUFF_CONFIRM === "0") return false;
+  return readConfig().confirm !== false;
+}
+
+export function setConfig(patch) {
   mkdirSync(dirname(AUTO_FILE), { recursive: true });
-  writeFileSync(AUTO_FILE, JSON.stringify({ auto: on }, null, 2) + "\n");
+  writeFileSync(AUTO_FILE, JSON.stringify({ ...readConfig(), ...patch }, null, 2) + "\n");
 }
 
 /** Is the freebuff command (FB_BIN, default `freebuff`) available? */
